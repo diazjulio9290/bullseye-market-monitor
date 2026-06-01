@@ -89,6 +89,25 @@ the fast cloud is stacked above the intermediate cloud — and nets them:
 - **Bullish**: price riding above green, upward-stacked clouds.
 - **Bearish**: price below red, downward-stacked clouds.
 
+## Scan history (Neon Postgres)
+
+The screener can persist each scan to a [Neon](https://neon.tech) Postgres
+database so you build a historical record of how conviction shifts over time.
+It's optional — without a connection the app runs normally and just hides the
+save controls.
+
+Provide the connection string one of two ways:
+
+```bash
+export NEON_DATABASE_URL="postgresql://USER:PASSWORD@ENDPOINT.neon.tech/DB?sslmode=require"
+```
+
+or copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` (gitignored)
+and fill in the `[neon] dsn` value. The app creates the `scan_runs` and
+`scan_results` tables automatically on first connect. In the Screener view, run a
+scan then click **💾 Save this scan**; past runs are listed below and any run can
+be re-inspected.
+
 ## Data source
 
 Price and news data come from Yahoo Finance via

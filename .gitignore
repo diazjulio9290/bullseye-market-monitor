@@ -12,6 +12,10 @@ env/
 # Streamlit
 .streamlit/secrets.toml
 
+# Secrets / env
+.env
+*.env
+
 # Logs
 *.log
 streamlit.log

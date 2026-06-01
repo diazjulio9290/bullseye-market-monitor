@@ -13,6 +13,7 @@ Run with:  streamlit run market_monitor.py
 
 import concurrent.futures as futures
 import datetime as dt
+import os
 from io import StringIO
 
 import numpy as np
@@ -874,6 +875,115 @@ def screen_all(universe, period, n_bull, n_bear, progress=None):
 
 
 # --------------------------------------------------------------------------
+# Neon Postgres — persist screener scan history.
+# The connection string is read from the NEON_DATABASE_URL env var, or from
+# .streamlit/secrets.toml ([neon] dsn = "..."). Never hard-coded / committed.
+# --------------------------------------------------------------------------
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS scan_runs (
+    id BIGSERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+    period TEXT, n_bull INT, n_bear INT,
+    scanned INT, scored INT
+);
+CREATE TABLE IF NOT EXISTS scan_results (
+    run_id BIGINT REFERENCES scan_runs(id) ON DELETE CASCADE,
+    bucket TEXT, ticker TEXT, label TEXT, conviction TEXT,
+    direction REAL, agreement REAL, participation INT,
+    upside REAL, pe REAL, days_to_earnings INT
+);
+"""
+
+
+def neon_dsn() -> str | None:
+    """Connection string from env var first, then Streamlit secrets."""
+    dsn = os.environ.get("NEON_DATABASE_URL")
+    if not dsn:
+        try:
+            dsn = st.secrets["neon"]["dsn"]
+        except Exception:
+            dsn = None
+    return dsn
+
+
+def _neon_connect():
+    import psycopg2
+    return psycopg2.connect(neon_dsn())
+
+
+@st.cache_resource(show_spinner=False)
+def neon_status() -> tuple[bool, str]:
+    """Connect once and ensure the schema exists. Returns (ok, message)."""
+    if not neon_dsn():
+        return False, "No connection string configured."
+    try:
+        conn = _neon_connect()
+        with conn, conn.cursor() as cur:
+            cur.execute(_SCHEMA_SQL)
+        conn.close()
+        return True, "Connected."
+    except Exception as e:  # noqa: BLE001 — surface any driver/network error
+        return False, f"{type(e).__name__}: {e}"
+
+
+def save_scan_to_neon(res: dict, period, n_bull, n_bear) -> int:
+    """Persist one scan (run row + per-ticker result rows). Returns run id."""
+    conn = _neon_connect()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(_SCHEMA_SQL)
+            cur.execute(
+                "INSERT INTO scan_runs (period, n_bull, n_bear, scanned, scored) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (period, n_bull, n_bear, res["scanned"], res["scored"]),
+            )
+            run_id = cur.fetchone()[0]
+            rows = [
+                (run_id, bucket, r["ticker"], r["label"], r["conviction"],
+                 r["direction"], r["agreement"], r["participation"],
+                 r.get("upside"), r.get("pe"), r.get("days_to_earnings"))
+                for bucket, items in res["buckets"].items() for r in items
+            ]
+            if rows:
+                cur.executemany(
+                    "INSERT INTO scan_results (run_id, bucket, ticker, label, "
+                    "conviction, direction, agreement, participation, upside, pe, "
+                    "days_to_earnings) VALUES "
+                    "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", rows)
+        return run_id
+    finally:
+        conn.close()
+
+
+def load_scan_runs(limit: int = 25) -> pd.DataFrame:
+    conn = _neon_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, ts, period, scanned, scored, n_bull, n_bear "
+                "FROM scan_runs ORDER BY ts DESC LIMIT %s", (limit,))
+            cols = [d[0] for d in cur.description]
+            return pd.DataFrame(cur.fetchall(), columns=cols)
+    finally:
+        conn.close()
+
+
+def load_run_results(run_id: int) -> pd.DataFrame:
+    conn = _neon_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT bucket, ticker, label, conviction, direction, agreement, "
+                "participation, upside, pe, days_to_earnings "
+                "FROM scan_results WHERE run_id = %s "
+                "ORDER BY direction DESC", (run_id,))
+            cols = [d[0] for d in cur.description]
+            return pd.DataFrame(cur.fetchall(), columns=cols)
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
 # Charts
 # --------------------------------------------------------------------------
 def price_chart(df: pd.DataFrame, ticker: str, dark: bool = False,
@@ -971,7 +1081,9 @@ def render_screener(universe, period, n_bull, n_bear, run):
         try:
             res = screen_all(universe, period, n_bull, n_bear,
                              progress=lambda f, t: bar.progress(f, t))
+            res["_meta"] = {"period": period, "n_bull": n_bull, "n_bear": n_bear}
             st.session_state["scan"] = res
+            st.session_state.pop("saved_run", None)  # new scan = unsaved
         finally:
             bar.empty()
 
@@ -1023,6 +1135,49 @@ def render_screener(universe, period, n_bull, n_bear, run):
     st.selectbox("Open a scanned ticker in the detail view",
                  ["—"] + sorted(all_scored), key="jump_pick",
                  on_change=_jump_to_detail)
+
+    # --- Neon Postgres: save this scan & browse history --------------------
+    st.markdown("##### 🗄️ Scan history (Neon Postgres)")
+    ok, msg = neon_status()
+    if not ok:
+        st.info(
+            "Not connected to Neon. Set `NEON_DATABASE_URL` (or add `[neon]` "
+            f"`dsn` to `.streamlit/secrets.toml`) to save scan history. — {msg}"
+        )
+        return
+
+    meta = res.get("_meta", {})
+    saved_id = st.session_state.get("saved_run")
+    cols = st.columns([1, 2])
+    if cols[0].button("💾 Save this scan", disabled=saved_id is not None,
+                      use_container_width=True):
+        try:
+            rid = save_scan_to_neon(res, meta.get("period"), meta.get("n_bull"),
+                                    meta.get("n_bear"))
+            st.session_state["saved_run"] = rid
+            st.rerun()
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Save failed: {e}")
+    if saved_id is not None:
+        cols[1].success(f"Saved as run #{saved_id}.")
+
+    try:
+        runs = load_scan_runs()
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Could not load history: {e}")
+        return
+    if runs.empty:
+        st.caption("No saved scans yet.")
+        return
+
+    st.caption("Past scans:")
+    st.dataframe(runs, use_container_width=True, hide_index=True)
+    labels = {f"#{r.id} · {r.ts:%Y-%m-%d %H:%M} · {r.period}": int(r.id)
+              for r in runs.itertuples()}
+    chosen = st.selectbox("Inspect a saved run", ["—"] + list(labels))
+    if chosen != "—":
+        st.dataframe(load_run_results(labels[chosen]),
+                     use_container_width=True, hide_index=True)
 
 
 # --------------------------------------------------------------------------
