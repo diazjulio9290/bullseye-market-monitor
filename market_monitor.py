@@ -904,28 +904,40 @@ def price_chart(df: pd.DataFrame, ticker: str, dark: bool = False,
     fig.add_trace(go.Candlestick(
         x=df.index, open=df["Open"], high=df["High"],
         low=df["Low"], close=df["Close"], name="Price"), row=1, col=1)
-    for col, color in [("SMA50", "#5B8FF9"), ("SMA200", "#F6BD16"),
-                       ("BB_up", "#9aa0aa"), ("BB_low", "#9aa0aa")]:
-        fig.add_trace(go.Scatter(x=df.index, y=df[col], name=col,
-                                 line=dict(width=1, color=color)), row=1, col=1)
+    # Trend MAs in distinct solid hues; Bollinger bands as subtle dotted gray
+    # so they read as context rather than competing with the moving averages.
+    fig.add_trace(go.Scatter(x=df.index, y=df["SMA50"], name="SMA 50",
+                             line=dict(width=1.7, color="#3B82F6")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["SMA200"], name="SMA 200",
+                             line=dict(width=1.7, color="#F97316")), row=1, col=1)
+    for col, nm in [("BB_up", "Boll upper"), ("BB_low", "Boll lower")]:
+        fig.add_trace(go.Scatter(x=df.index, y=df[col], name=nm,
+                                 line=dict(width=1, color="#94A3B8", dash="dot")),
+                      row=1, col=1)
 
     fig.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI",
-                             line=dict(color="#9270CA")), row=2, col=1)
+                             line=dict(width=1.6, color="#A855F7")), row=2, col=1)
     fig.add_hline(y=70, line_dash="dot", line_color="#e8684a", row=2, col=1)
     fig.add_hline(y=30, line_dash="dot", line_color="#5ad8a6", row=2, col=1)
 
-    fig.add_trace(go.Bar(x=df.index, y=df["MACD_hist"], name="Hist",
-                         marker_color="#888"), row=3, col=1)
+    # MACD histogram coloured by sign; MACD line cyan, Signal line amber.
+    hist_colors = ["rgba(34,197,94,0.55)" if v >= 0 else "rgba(239,83,80,0.55)"
+                   for v in df["MACD_hist"].fillna(0)]
+    fig.add_trace(go.Bar(x=df.index, y=df["MACD_hist"], name="Histogram",
+                         marker_color=hist_colors), row=3, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD",
-                             line=dict(color="#5B8FF9")), row=3, col=1)
+                             line=dict(width=1.8, color="#06B6D4")), row=3, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["MACD_signal"], name="Signal",
-                             line=dict(color="#F6BD16")), row=3, col=1)
+                             line=dict(width=1.8, color="#F59E0B")), row=3, col=1)
 
     fig.update_layout(height=720, xaxis_rangeslider_visible=False,
                       showlegend=True, margin=dict(t=40, b=20),
                       template=template)
     if dark:
         fig.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#0e1117")
+        # Dim the default plotly_dark gridlines so they don't overpower the data.
+        fig.update_xaxes(gridcolor="#1b212c", zerolinecolor="#2a2f3a")
+        fig.update_yaxes(gridcolor="#1b212c", zerolinecolor="#2a2f3a")
     return fig
 
 
