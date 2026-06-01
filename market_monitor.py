@@ -1,5 +1,5 @@
 """
-Market Monitor — an educational dashboard.
+Bullseye Market Monitor — an educational dashboard.
 
 What it does: pulls price/volume data, computes common technical indicators,
 and surfaces neutral *observations* for you to investigate and learn from.
@@ -1223,10 +1223,11 @@ def apply_theme(dark: bool) -> None:
 # --------------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------------
-st.set_page_config(page_title="Market Monitor", layout="wide")
+st.set_page_config(page_title="Bullseye Market Monitor", page_icon="🎯",
+                   layout="wide")
 st.session_state.setdefault("dark", False)
 apply_theme(st.session_state["dark"])
-st.title("Market Monitor")
+st.title("🎯 Bullseye Market Monitor")
 st.caption(
     "Educational tool. It describes what price has done and flags things "
     "worth investigating. It does not recommend trades or position sizes — "

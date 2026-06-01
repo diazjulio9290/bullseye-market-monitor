@@ -1,4 +1,4 @@
-# Market Monitor
+# 🎯 Bullseye Market Monitor
 
 An educational technical-analysis dashboard built with [Streamlit](https://streamlit.io/).
 
