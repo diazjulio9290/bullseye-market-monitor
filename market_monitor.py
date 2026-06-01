@@ -1275,6 +1275,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.caption(f"Loaded {dt.datetime.now():%Y-%m-%d %H:%M}")
+    st.caption("Developed by **Julio Diaz**")
 
 if view == "📋 Screener":
     render_screener(universe, scan_period, scan_bull, scan_bear, scan_run)
