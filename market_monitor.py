@@ -11,6 +11,7 @@ The interpretation is yours.
 Run with:  streamlit run market_monitor.py
 """
 
+import concurrent.futures as futures
 import datetime as dt
 from io import StringIO
 
@@ -140,7 +141,17 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["BB_up"] = mid + 2 * std
     df["BB_low"] = mid - 2 * std
 
+    # Ripster EMA Clouds — pairs of EMAs whose shaded gap forms a "cloud".
+    # A cloud is bullish (green) when its faster EMA is above its slower EMA.
+    for span in (5, 12, 34, 50, 72, 89):
+        df[f"EMA{span}"] = c.ewm(span=span, adjust=False).mean()
+
     return df
+
+
+# Ripster EMA cloud pairs: (fast, slow, short-label). Short / intermediate /
+# longer-term, mirroring the clouds Ripster47 popularised.
+RIPSTER_CLOUDS = [(5, 12, "5/12"), (34, 50, "34/50"), (72, 89, "72/89")]
 
 
 def crossed(series_a: pd.Series, series_b: pd.Series) -> str | None:
@@ -210,6 +221,17 @@ def observations(df: pd.DataFrame) -> list[tuple[str, str]]:
         elif last["Close"] <= last["BB_low"]:
             out.append(("Price is touching the lower Bollinger Band.",
                         "Same idea — investigate why volatility expanded."))
+
+    if "EMA5" in df.columns and pd.notna(last["EMA89"]):
+        rip, detail = lens_ripster(df)
+        if rip > 0:
+            out.append(("Ripster EMA clouds are aligned bullish.",
+                        f"{detail}. Ripster traders watch for price to hold "
+                        "above the clouds as support — study where it last failed."))
+        elif rip < 0:
+            out.append(("Ripster EMA clouds are aligned bearish.",
+                        f"{detail}. Clouds above price often act as resistance — "
+                        "see whether prior bounces stalled there."))
 
     if not out:
         out.append(("Nothing notable on the indicators right now.",
@@ -498,6 +520,53 @@ def lens_momentum(df: pd.DataFrame) -> tuple[int, str]:
     return _avg_vote(parts), ", ".join(notes) or "n/a"
 
 
+def lens_ripster(df: pd.DataFrame) -> tuple[int, str]:
+    """Ripster EMA Clouds. Bullish when price rides above green, stacked clouds.
+
+    Five checks: each cloud's colour (fast EMA above slow = green), price vs the
+    fast cloud, and whether the fast cloud is stacked above the intermediate
+    cloud. Net of bullish minus bearish checks drives the vote.
+    """
+    last = df.iloc[-1]
+    cols = ["EMA5", "EMA12", "EMA34", "EMA50", "EMA72", "EMA89"]
+    if any(c not in df.columns or pd.isna(last[c]) for c in cols):
+        return 0, "insufficient history"
+
+    bull = bear = 0
+    # Cloud colours (faster EMA above slower = bullish/green).
+    colours = []
+    for fast, slow, label in RIPSTER_CLOUDS:
+        green = last[f"EMA{fast}"] > last[f"EMA{slow}"]
+        bull += green
+        bear += not green
+        colours.append(f"{label}{'🟢' if green else '🔴'}")
+
+    # Price relative to the fast (5/12) cloud.
+    fast_hi = max(last["EMA5"], last["EMA12"])
+    fast_lo = min(last["EMA5"], last["EMA12"])
+    price = last["Close"]
+    if price > fast_hi:
+        bull += 1; price_note = "price above fast cloud"
+    elif price < fast_lo:
+        bear += 1; price_note = "price below fast cloud"
+    else:
+        price_note = "price inside fast cloud"
+
+    # Cloud stacking: fast (5/12) fully above intermediate (34/50) = bullish.
+    mid_hi = max(last["EMA34"], last["EMA50"])
+    mid_lo = min(last["EMA34"], last["EMA50"])
+    if fast_lo > mid_hi:
+        bull += 1; stack_note = "stacked bullish"
+    elif fast_hi < mid_lo:
+        bear += 1; stack_note = "stacked bearish"
+    else:
+        stack_note = "clouds overlapping"
+
+    vote = 1 if bull - bear >= 2 else -1 if bull - bear <= -2 else 0
+    detail = f"{bull}/5 bullish · {' '.join(colours)} · {price_note} · {stack_note}"
+    return vote, detail
+
+
 def lens_valuation(f: dict) -> tuple[int, str]:
     parts, notes = [], []
     pe = f.get("forwardPE") or f.get("trailingPE")
@@ -590,6 +659,7 @@ def conviction_engine(df, f, a, env, rel, news_avg, n_news, days_to_earnings):
     lenses = [
         ("Trend", 1.0, *lens_trend(df)),
         ("Momentum", 1.0, *lens_momentum(df)),
+        ("Ripster EMA clouds", 1.0, *lens_ripster(df)),
         ("Valuation", 1.0, *lens_valuation(f)),
         ("Quality / growth", 1.0, *lens_quality(f)),
         ("Analyst targets", 1.0, *lens_analysts(a)),
@@ -648,21 +718,194 @@ def conviction_engine(df, f, a, env, rel, news_avg, n_news, days_to_earnings):
 
 
 # --------------------------------------------------------------------------
+# Screener — scan the whole index, bucket by direction × conviction.
+# Hybrid: a cheap technical pre-screen on all names (batch price download),
+# then the full conviction engine on a bounded shortlist (threaded). News is
+# omitted in bulk mode for speed, so screener scores use up to 7 lenses.
+# --------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def batch_close(tickers: tuple, period: str) -> dict:
+    """Batch-download Close series for many tickers, chunked to stay polite."""
+    out: dict = {}
+    step = 120
+    for i in range(0, len(tickers), step):
+        part = list(tickers[i:i + step])
+        try:
+            data = yf.download(part, period=period, auto_adjust=True,
+                               progress=False, threads=True)
+            if "Close" in data:
+                close = data["Close"]
+            else:
+                close = data
+            if isinstance(close, pd.Series):  # single-ticker shape
+                s = close.dropna()
+                if len(s):
+                    out[part[0]] = s
+            else:
+                for col in close.columns:
+                    s = close[col].dropna()
+                    if len(s):
+                        out[col] = s
+        except Exception:
+            continue
+    return out
+
+
+def _tech_score(close: pd.Series):
+    """Stage-1 technical lean from price alone: (score in -2..2, 3-mo return)."""
+    s = close.dropna()
+    if len(s) < 200:
+        return None
+    df = add_indicators(pd.DataFrame({"Close": s}))
+    tv, _ = lens_trend(df)
+    mv, _ = lens_momentum(df)
+    return tv + mv, (_pct_return(s, 63) or 0.0)
+
+
+def _screen_one(ticker, close, spy_close, sector_closes, env):
+    """Full conviction for one name (no per-name news fetch, for speed)."""
+    try:
+        df = add_indicators(pd.DataFrame({"Close": close.dropna()}))
+        info = yf.Ticker(ticker).info or {}
+        f = {k: info.get(k) for k in (
+            "trailingPE", "forwardPE", "pegRatio",
+            "priceToSalesTrailing12Months", "profitMargins", "revenueGrowth",
+            "earningsGrowth", "returnOnEquity", "marketCap", "sector")}
+        price, target = info.get("currentPrice"), info.get("targetMeanPrice")
+        a = {
+            "price": price, "target_mean": target,
+            "upside": (target / price - 1) if (price and target) else None,
+            "rec_mean": info.get("recommendationMean"),
+            "rec_key": info.get("recommendationKey"),
+            "n_analysts": info.get("numberOfAnalystOpinions"),
+        }
+        try:
+            cal = yf.Ticker(ticker).calendar or {}
+            ds = cal.get("Earnings Date") or []
+            nxt = min(ds) if isinstance(ds, (list, tuple)) and ds else (ds or None)
+            days = (nxt - dt.date.today()).days if nxt else None
+        except Exception:
+            days = None
+        etf = SECTOR_ETF.get(f.get("sector") or "")
+        rel = {
+            "stock": _pct_return(close, 63),
+            "spy": _pct_return(spy_close, 63) if spy_close is not None else None,
+            "sector": _pct_return(sector_closes[etf], 63) if etf in sector_closes else None,
+            "etf": etf,
+        }
+        v = conviction_engine(df, f, a, env, rel, 0.0, 0, days)
+        return {
+            "ticker": ticker, "label": v["label"], "conviction": v["conviction"],
+            "direction": round(v["direction"], 2), "agreement": v["agreement"],
+            "participation": v["participation"], "days_to_earnings": days,
+            "upside": a["upside"], "pe": f.get("forwardPE") or f.get("trailingPE"),
+        }
+    except Exception:
+        return None
+
+
+def screen_all(universe, period, n_bull, n_bear, progress=None):
+    """Two-stage scan. progress(frac, text) is an optional UI callback."""
+    def report(frac, text):
+        if progress:
+            progress(min(frac, 1.0), text)
+
+    report(0.05, "Loading market environment & benchmarks…")
+    env = market_environment()
+    spy = fetch("SPY", period)
+    spy_close = spy["Close"] if not spy.empty else None
+    sector_closes = {}
+    for etf in set(SECTOR_ETF.values()):
+        h = fetch(etf, period)
+        if not h.empty:
+            sector_closes[etf] = h["Close"]
+
+    report(0.15, f"Downloading prices for {len(universe)} tickers…")
+    closes = batch_close(tuple(universe), period)
+
+    report(0.45, "Technical pre-screen on all names…")
+    tech = {}
+    for t, s in closes.items():
+        r = _tech_score(s)
+        if r is not None:
+            tech[t] = r
+
+    bulls = sorted((t for t in tech if tech[t][0] > 0),
+                   key=lambda t: (tech[t][0], tech[t][1]), reverse=True)[:n_bull]
+    bears = sorted((t for t in tech if tech[t][0] < 0),
+                   key=lambda t: (tech[t][0], tech[t][1]))[:n_bear]
+    shortlist = bulls + bears
+
+    report(0.5, f"Full conviction scan on {len(shortlist)} candidates…")
+    results, done = [], 0
+    with futures.ThreadPoolExecutor(max_workers=10) as ex:
+        futs = {ex.submit(_screen_one, t, closes[t], spy_close, sector_closes, env): t
+                for t in shortlist}
+        for fut in futures.as_completed(futs):
+            r = fut.result()
+            done += 1
+            if r:
+                results.append(r)
+            report(0.5 + 0.5 * done / max(len(shortlist), 1),
+                   f"Scored {done}/{len(shortlist)}…")
+
+    buckets = {"Strong Buy": [], "Buy": [], "Watch / Mixed": [],
+               "Sell": [], "Strong Sell": []}
+    for r in results:
+        L, C = r["label"], r["conviction"]
+        if L == "BUY" and C == "HIGH":
+            buckets["Strong Buy"].append(r)
+        elif L == "BUY" and C == "MEDIUM":
+            buckets["Buy"].append(r)
+        elif L == "SELL" and C == "HIGH":
+            buckets["Strong Sell"].append(r)
+        elif L == "SELL" and C == "MEDIUM":
+            buckets["Sell"].append(r)
+        else:
+            buckets["Watch / Mixed"].append(r)
+    for name in ("Strong Buy", "Buy"):
+        buckets[name].sort(key=lambda r: (r["agreement"], r["direction"]), reverse=True)
+    for name in ("Sell", "Strong Sell"):
+        buckets[name].sort(key=lambda r: (r["agreement"], -r["direction"]), reverse=True)
+
+    report(1.0, "Done.")
+    return {"buckets": buckets, "scored": len(results),
+            "shortlist": len(shortlist), "scanned": len(closes)}
+
+
+# --------------------------------------------------------------------------
 # Charts
 # --------------------------------------------------------------------------
-def price_chart(df: pd.DataFrame, ticker: str) -> go.Figure:
+def price_chart(df: pd.DataFrame, ticker: str, dark: bool = False,
+                show_clouds: bool = True) -> go.Figure:
+    template = "plotly_dark" if dark else "plotly_white"
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03,
         row_heights=[0.6, 0.2, 0.2],
-        subplot_titles=(f"{ticker} — price, moving averages & Bollinger Bands",
+        subplot_titles=(f"{ticker} — price, MAs, Bollinger & Ripster EMA clouds",
                         "RSI (14)", "MACD (12/26/9)"),
     )
+
+    # Ripster EMA clouds first, so they sit behind the candles. Each cloud is
+    # tinted by its CURRENT colour (faster EMA above slower = green).
+    if show_clouds:
+        for fast, slow, label in RIPSTER_CLOUDS:
+            green = df[f"EMA{fast}"].iloc[-1] > df[f"EMA{slow}"].iloc[-1]
+            fill = "rgba(38,166,154,0.13)" if green else "rgba(239,83,80,0.13)"
+            edge = "rgba(38,166,154,0.55)" if green else "rgba(239,83,80,0.55)"
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df[f"EMA{slow}"], line=dict(width=0),
+                showlegend=False, hoverinfo="skip"), row=1, col=1)
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df[f"EMA{fast}"], fill="tonexty", fillcolor=fill,
+                line=dict(width=1, color=edge),
+                name=f"Ripster {label}"), row=1, col=1)
 
     fig.add_trace(go.Candlestick(
         x=df.index, open=df["Open"], high=df["High"],
         low=df["Low"], close=df["Close"], name="Price"), row=1, col=1)
     for col, color in [("SMA50", "#5B8FF9"), ("SMA200", "#F6BD16"),
-                       ("BB_up", "#bbb"), ("BB_low", "#bbb")]:
+                       ("BB_up", "#9aa0aa"), ("BB_low", "#9aa0aa")]:
         fig.add_trace(go.Scatter(x=df.index, y=df[col], name=col,
                                  line=dict(width=1, color=color)), row=1, col=1)
 
@@ -672,21 +915,150 @@ def price_chart(df: pd.DataFrame, ticker: str) -> go.Figure:
     fig.add_hline(y=30, line_dash="dot", line_color="#5ad8a6", row=2, col=1)
 
     fig.add_trace(go.Bar(x=df.index, y=df["MACD_hist"], name="Hist",
-                         marker_color="#ccc"), row=3, col=1)
+                         marker_color="#888"), row=3, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD",
                              line=dict(color="#5B8FF9")), row=3, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["MACD_signal"], name="Signal",
                              line=dict(color="#F6BD16")), row=3, col=1)
 
     fig.update_layout(height=720, xaxis_rangeslider_visible=False,
-                      showlegend=True, margin=dict(t=40, b=20))
+                      showlegend=True, margin=dict(t=40, b=20),
+                      template=template)
+    if dark:
+        fig.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#0e1117")
     return fig
+
+
+# --------------------------------------------------------------------------
+# Screener view
+# --------------------------------------------------------------------------
+_BUCKET_STYLE = {
+    "Strong Buy": ("🟢🟢", "#16a34a"), "Buy": ("🟢", "#22c55e"),
+    "Watch / Mixed": ("🟡", "#eab308"), "Sell": ("🔴", "#ef4444"),
+    "Strong Sell": ("🔴🔴", "#b91c1c"),
+}
+
+
+def render_screener(universe, period, n_bull, n_bear, run):
+    st.header("📋 S&P 500 conviction screener")
+    st.caption(
+        "Runs the same engine across the index and buckets names by direction × "
+        "conviction. A fast technical pre-screen ranks all names, then the full "
+        "engine scores the strongest bullish and bearish candidates. **News is "
+        "skipped in bulk mode for speed**, so scores use up to 7 lenses."
+    )
+    st.warning(
+        "In a bull market the Buy buckets crowd up and Sell stays sparse — that's "
+        "the structural lean, not a signal. The **Watch / Mixed** bucket (genuine "
+        "disagreement) is often the most informative. Not financial advice.",
+        icon="⚠️",
+    )
+
+    if run:
+        bar = st.progress(0.0, "Starting…")
+        try:
+            res = screen_all(universe, period, n_bull, n_bear,
+                             progress=lambda f, t: bar.progress(f, t))
+            st.session_state["scan"] = res
+        finally:
+            bar.empty()
+
+    res = st.session_state.get("scan")
+    if not res:
+        st.info("Pick candidate counts in the sidebar, then click **Run scan**.")
+        return
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Names scanned", res["scanned"])
+    m2.metric("Fully scored", res["scored"])
+    counts = {k: len(v) for k, v in res["buckets"].items()}
+    m3.metric("Strong Buy / Strong Sell",
+              f"{counts['Strong Buy']} / {counts['Strong Sell']}")
+
+    all_scored = []
+    for rows in res["buckets"].values():
+        all_scored.extend(r["ticker"] for r in rows)
+
+    for name, rows in res["buckets"].items():
+        emoji, color = _BUCKET_STYLE[name]
+        with st.expander(f"{emoji}  {name}  ·  {len(rows)}",
+                         expanded=name in ("Strong Buy", "Strong Sell") and bool(rows)):
+            if not rows:
+                st.caption("Nothing in this bucket.")
+                continue
+            table = pd.DataFrame([{
+                "Ticker": r["ticker"],
+                "Dir": r["direction"],
+                "Conviction": r["conviction"],
+                "Agree %": round(r["agreement"] * 100),
+                "Lenses": r["participation"],
+                "Upside %": (round(r["upside"] * 100) if r["upside"] is not None else None),
+                "P/E": (round(r["pe"], 1) if r["pe"] else None),
+                "Earnings in": r["days_to_earnings"],
+            } for r in rows])
+            st.dataframe(table, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    def _jump_to_detail():
+        # Runs as a callback, before widgets are instantiated on the rerun,
+        # so modifying the "view" radio's state here is allowed.
+        pick = st.session_state.get("jump_pick")
+        if pick and pick != "—":
+            st.session_state["force_ticker"] = pick
+            st.session_state["view"] = "📈 Single ticker"
+
+    st.selectbox("Open a scanned ticker in the detail view",
+                 ["—"] + sorted(all_scored), key="jump_pick",
+                 on_change=_jump_to_detail)
+
+
+# --------------------------------------------------------------------------
+# Theme — a CSS-injected dark mode, toggled from the sidebar.
+# --------------------------------------------------------------------------
+_DARK_CSS = """
+<style>
+.stApp { background-color: #0e1117; }
+.stApp, .stApp p, .stApp span, .stApp li, .stApp label,
+[data-testid="stMarkdownContainer"], [data-testid="stWidgetLabel"] p {
+    color: #e6edf3 !important;
+}
+h1, h2, h3, h4, h5, h6 { color: #ffffff !important; }
+section[data-testid="stSidebar"] { background-color: #11151c !important; }
+[data-testid="stHeader"] { background: rgba(0,0,0,0) !important; }
+[data-testid="stMetricValue"] { color: #ffffff !important; }
+[data-testid="stMetricLabel"] p { color: #9aa4b2 !important; }
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p { color: #9aa4b2 !important; }
+[data-testid="stExpander"] details {
+    background-color: #11151c !important; border: 1px solid #2a2f3a !important;
+}
+[data-testid="stExpander"] summary { color: #e6edf3 !important; }
+div[data-testid="stVerticalBlockBorderWrapper"] { border-color: #2a2f3a !important; }
+.stTextInput input, .stNumberInput input {
+    background-color: #1c212b !important; color: #e6edf3 !important;
+}
+div[data-baseweb="select"] > div {
+    background-color: #1c212b !important; color: #e6edf3 !important;
+    border-color: #2a2f3a !important;
+}
+[data-baseweb="popover"] li, [role="option"] {
+    background-color: #1c212b !important; color: #e6edf3 !important;
+}
+</style>
+"""
+
+
+def apply_theme(dark: bool) -> None:
+    if dark:
+        st.markdown(_DARK_CSS, unsafe_allow_html=True)
 
 
 # --------------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------------
 st.set_page_config(page_title="Market Monitor", layout="wide")
+st.session_state.setdefault("dark", False)
+apply_theme(st.session_state["dark"])
 st.title("Market Monitor")
 st.caption(
     "Educational tool. It describes what price has done and flags things "
@@ -694,28 +1066,51 @@ st.caption(
     "that's on you. Not financial advice."
 )
 
+universe = sp500_tickers()
+ticker = None
+period = "1y"
+scan_period = scan_bull = scan_bear = scan_run = None
+
 with st.sidebar:
-    st.header("Settings")
+    head_l, head_r = st.columns([2, 1])
+    head_l.header("Settings")
+    head_r.toggle("🌙", key="dark", help="Toggle dark mode")
+    view = st.radio("View", ["📈 Single ticker", "📋 Screener"], key="view",
+                    label_visibility="collapsed")
+    st.markdown("---")
 
-    universe = sp500_tickers()
-    default_idx = universe.index("AAPL") if "AAPL" in universe else 0
-    ticker = st.selectbox(
-        f"S&P 500 ({len(universe)} symbols)", universe, index=default_idx,
-        help="Type to search. List refreshes from Wikipedia daily.",
-    )
+    if view == "📈 Single ticker":
+        # Honor a jump request from the screener.
+        forced = st.session_state.pop("force_ticker", None)
+        if forced and forced in universe:
+            st.session_state["detail_ticker"] = forced
+        st.session_state.setdefault("detail_ticker",
+                                    "AAPL" if "AAPL" in universe else universe[0])
+        ticker = st.selectbox(
+            f"S&P 500 ({len(universe)} symbols)", universe, key="detail_ticker",
+            help="Type to search. List refreshes from Wikipedia daily.",
+        )
+        custom = st.text_input(
+            "…or enter any other symbol", value="",
+            placeholder="e.g. SPY, BTC-USD",
+        ).strip().upper()
+        if custom:
+            ticker = custom
+        period = st.selectbox("Period", ["6mo", "1y", "2y", "5y", "max"], index=1)
+    else:
+        st.subheader("Screener")
+        scan_period = st.selectbox("History", ["1y", "2y"], index=0)
+        scan_bull = st.slider("Bullish candidates", 20, 120, 60, 10)
+        scan_bear = st.slider("Bearish candidates", 0, 80, 30, 10)
+        scan_run = st.button("🔍 Run scan", type="primary",
+                             use_container_width=True)
 
-    custom = st.text_input(
-        "…or enter any other symbol", value="",
-        placeholder="e.g. SPY, BTC-USD",
-    ).strip().upper()
-    if custom:
-        ticker = custom
-
-    period = st.selectbox(
-        "Period", ["6mo", "1y", "2y", "5y", "max"], index=1
-    )
     st.markdown("---")
     st.caption(f"Loaded {dt.datetime.now():%Y-%m-%d %H:%M}")
+
+if view == "📋 Screener":
+    render_screener(universe, scan_period, scan_bull, scan_bear, scan_run)
+    st.stop()
 
 if not ticker:
     st.info("Add at least one ticker in the sidebar.")
@@ -741,7 +1136,8 @@ c3.metric("50-day SMA",
 c4.metric("200-day SMA",
           f"${last['SMA200']:,.2f}" if pd.notna(last["SMA200"]) else "—")
 
-st.plotly_chart(price_chart(data, ticker), use_container_width=True)
+st.plotly_chart(price_chart(data, ticker, dark=st.session_state["dark"]),
+                use_container_width=True)
 
 st.subheader("Observations to investigate")
 for flag, note in observations(data):

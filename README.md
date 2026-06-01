@@ -17,15 +17,20 @@ investigating, and renders a **mechanical** Buy / Neutral / Sell summary.
   daily from Wikipedia (with a baked-in offline fallback). Plus a custom-symbol
   box for anything else (ETFs, crypto like `BTC-USD`, etc.).
 - **Indicators** computed transparently: SMA 50/200, RSI (14, Wilder),
-  MACD (12/26/9), Bollinger Bands (20, 2σ).
+  MACD (12/26/9), Bollinger Bands (20, 2σ), and **Ripster EMA Clouds**
+  (5/12, 34/50, 72/89) shaded green/red on the chart.
 - **Interactive Plotly charts** — candlesticks with overlays, plus RSI and MACD
-  subplots.
+  subplots. **Dark mode** toggle in the sidebar.
 - **Observations** — neutral flags (golden/death cross, overbought/oversold,
-  band tags) each paired with what to go learn about.
+  band tags, Ripster cloud alignment) each paired with what to go learn about.
 - **Conviction dashboard** — a Buy/Neutral/Sell **direction** *and* a
-  High/Medium/Low **conviction** read derived from how much eight independent
+  High/Medium/Low **conviction** read derived from how much nine independent
   lenses agree, plus the supporting fundamentals, analyst targets, market
   environment, relative strength, and event-risk data behind it.
+- **S&P 500 screener** — scans the whole index and buckets names into Strong Buy /
+  Buy / Watch-Mixed / Sell / Strong Sell. Hybrid: a fast technical pre-screen on
+  all 503, then the full engine on the strongest candidates (threaded). Click any
+  result to open it in the detail view.
 
 ## Setup
 
@@ -45,12 +50,13 @@ Then open <http://localhost:8501>.
 
 ## How conviction is scored
 
-Eight independent lenses each cast a −1 / 0 / +1 vote:
+Nine independent lenses each cast a −1 / 0 / +1 vote:
 
 | Lens | What it reads |
 | --- | --- |
 | Trend | price vs 200-day, 50/200 regime |
 | Momentum | MACD vs signal, RSI zone |
+| Ripster EMA clouds | cloud colours, price vs fast cloud, cloud stacking |
 | Valuation | P/E, PEG, P/S |
 | Quality / growth | revenue & EPS growth, margins, ROE |
 | Analyst targets | implied upside, consensus rating |
@@ -71,6 +77,17 @@ if it leans one way. Weights and thresholds are simple defaults; tune to taste.
 > (Wall Street rarely says "sell"; most names sit above their 200-day in a bull
 > market). Expect a bullish lean for quality large-caps — the tool is most
 > useful when it flags *conflict*, not agreement.
+
+### Ripster EMA Clouds
+
+Popularised by Ripster47, each "cloud" is the shaded gap between a fast and a
+slow EMA — here 5/12 (short), 34/50 (intermediate) and 72/89 (longer). A cloud is
+**green** when its faster EMA leads, **red** when it lags. The lens runs five
+checks — the three cloud colours, price relative to the fast cloud, and whether
+the fast cloud is stacked above the intermediate cloud — and nets them:
+
+- **Bullish**: price riding above green, upward-stacked clouds.
+- **Bearish**: price below red, downward-stacked clouds.
 
 ## Data source
 
