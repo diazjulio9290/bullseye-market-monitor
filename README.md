@@ -22,8 +22,10 @@ investigating, and renders a **mechanical** Buy / Neutral / Sell summary.
   subplots.
 - **Observations** — neutral flags (golden/death cross, overbought/oversold,
   band tags) each paired with what to go learn about.
-- **Mechanical suggestion** — a single Buy/Neutral/Sell verdict with a full,
-  transparent breakdown of every contributing signal and the headlines factored in.
+- **Conviction dashboard** — a Buy/Neutral/Sell **direction** *and* a
+  High/Medium/Low **conviction** read derived from how much eight independent
+  lenses agree, plus the supporting fundamentals, analyst targets, market
+  environment, relative strength, and event-risk data behind it.
 
 ## Setup
 
@@ -41,19 +43,34 @@ streamlit run market_monitor.py
 
 Then open <http://localhost:8501>.
 
-## How the suggestion is scored
+## How conviction is scored
 
-Each technical signal casts a −1 / 0 / +1 vote (RSI zone, price vs 200-day,
-50/200 trend regime, MACD vs signal, Bollinger position). Recent headlines are
-scored with a small positive/negative keyword lexicon. The two are blended:
+Eight independent lenses each cast a −1 / 0 / +1 vote:
 
-```
-score = 0.75 × (technical votes, normalized) + 0.25 × (news tilt, normalized)
-```
+| Lens | What it reads |
+| --- | --- |
+| Trend | price vs 200-day, 50/200 regime |
+| Momentum | MACD vs signal, RSI zone |
+| Valuation | P/E, PEG, P/S |
+| Quality / growth | revenue & EPS growth, margins, ROE |
+| Analyst targets | implied upside, consensus rating |
+| Market regime | SPY vs 200-day, VIX |
+| Relative strength | 3-mo return vs SPY and sector ETF |
+| News sentiment | keyword lexicon over recent headlines (½ weight) |
 
-`score ≥ +0.34 → BUY`, `score ≤ −0.34 → SELL`, otherwise `NEUTRAL`.
+- **Direction** is the weighted net vote: `≥ +0.30 → BUY`, `≤ −0.30 → SELL`,
+  otherwise `NEUTRAL`.
+- **Conviction** is *agreement*, not strength: HIGH only when ≥78% of the active
+  lenses point the same way (and ≥5 are active); MEDIUM at ≥62%; otherwise LOW.
+  Earnings within 7 days caps conviction down a notch.
 
-The weights and thresholds are simple defaults — tune them to taste.
+The point is to surface **disagreement** — a contested call should read LOW even
+if it leans one way. Weights and thresholds are simple defaults; tune to taste.
+
+> Note: analyst consensus and the trend/regime lenses skew structurally bullish
+> (Wall Street rarely says "sell"; most names sit above their 200-day in a bull
+> market). Expect a bullish lean for quality large-caps — the tool is most
+> useful when it flags *conflict*, not agreement.
 
 ## Data source
 

@@ -329,34 +329,321 @@ def news_sentiment(items: list[dict]) -> tuple[float, list[tuple[dict, int]]]:
     return avg, scored
 
 
-def combined_suggestion(df: pd.DataFrame, news_avg: float) -> dict:
-    """Blend technical votes with news tilt into one Buy/Neutral/Sell label."""
-    signals = technical_signals(df)
-    tech_votes = [v for _, v, _ in signals]
-    tech_sum = sum(tech_votes)
-    tech_max = len(tech_votes) or 1
-    tech_norm = tech_sum / tech_max  # -1 .. +1
+# --------------------------------------------------------------------------
+# Fundamentals, analysts, environment — the non-chart lenses.
+# Every fetch is wrapped: missing data degrades the lens to "no opinion"
+# rather than crashing the app.
+# --------------------------------------------------------------------------
+# SPDR sector ETFs, keyed by yfinance's sector names, for relative strength.
+SECTOR_ETF = {
+    "Technology": "XLK", "Financial Services": "XLF", "Healthcare": "XLV",
+    "Consumer Cyclical": "XLY", "Consumer Defensive": "XLP", "Energy": "XLE",
+    "Industrials": "XLI", "Basic Materials": "XLB", "Real Estate": "XLRE",
+    "Utilities": "XLU", "Communication Services": "XLC",
+}
 
-    news_norm = max(-1.0, min(1.0, news_avg / 2.0))  # squash to -1 .. +1
 
-    # Technicals carry the weight here; news is a tilt, not a driver.
-    blended = 0.75 * tech_norm + 0.25 * news_norm
+@st.cache_data(ttl=3600)
+def fundamentals(ticker: str) -> dict:
+    """Valuation / quality / growth snapshot from yfinance .info."""
+    try:
+        info = yf.Ticker(ticker).info or {}
+    except Exception:
+        return {}
+    fields = [
+        "trailingPE", "forwardPE", "pegRatio", "priceToSalesTrailing12Months",
+        "priceToBook", "enterpriseToEbitda", "profitMargins", "revenueGrowth",
+        "earningsGrowth", "returnOnEquity", "debtToEquity", "dividendYield",
+        "beta", "marketCap", "freeCashflow", "sector", "industry",
+        "longName", "currentPrice",
+    ]
+    return {k: info.get(k) for k in fields}
 
-    if blended >= 0.34:
+
+@st.cache_data(ttl=3600)
+def analyst_view(ticker: str) -> dict:
+    """Analyst price target + consensus rating."""
+    try:
+        info = yf.Ticker(ticker).info or {}
+    except Exception:
+        return {}
+    price = info.get("currentPrice")
+    target = info.get("targetMeanPrice")
+    upside = (target / price - 1) if (price and target) else None
+    return {
+        "price": price,
+        "target_mean": target,
+        "target_high": info.get("targetHighPrice"),
+        "target_low": info.get("targetLowPrice"),
+        "upside": upside,
+        "rec_mean": info.get("recommendationMean"),   # 1 strong buy .. 5 strong sell
+        "rec_key": info.get("recommendationKey"),
+        "n_analysts": info.get("numberOfAnalystOpinions"),
+    }
+
+
+@st.cache_data(ttl=3600)
+def earnings_proximity(ticker: str) -> dict:
+    """Days until next earnings date (event risk)."""
+    try:
+        cal = yf.Ticker(ticker).calendar or {}
+        dates = cal.get("Earnings Date") or []
+        if isinstance(dates, (list, tuple)) and dates:
+            nxt = min(dates)
+        else:
+            nxt = dates or None
+        if nxt is None:
+            return {"date": None, "days": None}
+        days = (nxt - dt.date.today()).days
+        return {"date": nxt, "days": days}
+    except Exception:
+        return {"date": None, "days": None}
+
+
+@st.cache_data(ttl=1800)
+def market_environment() -> dict:
+    """Broad-market regime: SPY trend, VIX level, 10-yr yield."""
+    env: dict = {}
+    try:
+        spy = fetch("SPY", "1y")
+        if not spy.empty:
+            sma200 = spy["Close"].rolling(200).mean().iloc[-1]
+            last = spy["Close"].iloc[-1]
+            env["spy_last"] = last
+            env["spy_sma200"] = sma200
+            env["spy_above_200"] = bool(pd.notna(sma200) and last > sma200)
+            env["spy_ret_3m"] = _pct_return(spy["Close"], 63)
+    except Exception:
+        pass
+    try:
+        vix = fetch("^VIX", "6mo")
+        env["vix"] = float(vix["Close"].iloc[-1]) if not vix.empty else None
+    except Exception:
+        env["vix"] = None
+    try:
+        tnx = fetch("^TNX", "6mo")
+        # ^TNX is quoted in tenths of a percent on some feeds; here it's the yield.
+        env["tnx"] = float(tnx["Close"].iloc[-1]) if not tnx.empty else None
+    except Exception:
+        env["tnx"] = None
+    return env
+
+
+def _pct_return(close: pd.Series, lookback: int) -> float | None:
+    s = close.dropna()
+    if len(s) <= lookback:
+        return None
+    return float(s.iloc[-1] / s.iloc[-1 - lookback] - 1)
+
+
+@st.cache_data(ttl=1800)
+def relative_strength(ticker: str, sector: str | None) -> dict:
+    """3-month return of the stock vs SPY and its sector ETF."""
+    out: dict = {"stock": None, "spy": None, "sector": None, "etf": None}
+    try:
+        out["stock"] = _pct_return(fetch(ticker, "1y")["Close"], 63)
+        out["spy"] = _pct_return(fetch("SPY", "1y")["Close"], 63)
+        etf = SECTOR_ETF.get(sector or "")
+        if etf:
+            out["etf"] = etf
+            out["sector"] = _pct_return(fetch(etf, "1y")["Close"], 63)
+    except Exception:
+        pass
+    return out
+
+
+# --------------------------------------------------------------------------
+# Conviction engine — independent lenses vote; conviction = how much they agree
+# --------------------------------------------------------------------------
+def _avg_vote(parts: list[int]) -> int:
+    """Collapse sub-scores into a single -1/0/+1 vote."""
+    parts = [p for p in parts if p is not None]
+    if not parts:
+        return 0
+    m = sum(parts) / len(parts)
+    return 1 if m >= 0.34 else -1 if m <= -0.34 else 0
+
+
+def lens_trend(df: pd.DataFrame) -> tuple[int, str]:
+    last = df.iloc[-1]
+    parts, notes = [], []
+    if pd.notna(last["SMA200"]):
+        up = last["Close"] > last["SMA200"]
+        parts.append(1 if up else -1)
+        notes.append(f"price {'above' if up else 'below'} 200-day")
+    if pd.notna(last["SMA50"]) and pd.notna(last["SMA200"]):
+        up = last["SMA50"] > last["SMA200"]
+        parts.append(1 if up else -1)
+        notes.append(f"50d {'>' if up else '<'} 200d")
+    return _avg_vote(parts), ", ".join(notes) or "insufficient history"
+
+
+def lens_momentum(df: pd.DataFrame) -> tuple[int, str]:
+    last = df.iloc[-1]
+    parts, notes = [], []
+    if pd.notna(last["MACD"]) and pd.notna(last["MACD_signal"]):
+        up = last["MACD"] > last["MACD_signal"]
+        parts.append(1 if up else -1)
+        notes.append(f"MACD {'>' if up else '<'} signal")
+    rsi = last["RSI"]
+    if pd.notna(rsi):
+        if rsi >= 70:
+            parts.append(0); notes.append(f"RSI {rsi:.0f} overbought")
+        elif rsi <= 30:
+            parts.append(0); notes.append(f"RSI {rsi:.0f} oversold")
+        elif rsi >= 50:
+            parts.append(1); notes.append(f"RSI {rsi:.0f}")
+        else:
+            parts.append(-1); notes.append(f"RSI {rsi:.0f}")
+    return _avg_vote(parts), ", ".join(notes) or "n/a"
+
+
+def lens_valuation(f: dict) -> tuple[int, str]:
+    parts, notes = [], []
+    pe = f.get("forwardPE") or f.get("trailingPE")
+    if pe and pe > 0:
+        parts.append(1 if pe < 15 else -1 if pe > 30 else 0)
+        notes.append(f"P/E {pe:.0f}")
+    peg = f.get("pegRatio")
+    if peg and peg > 0:
+        parts.append(1 if peg < 1 else -1 if peg > 2 else 0)
+        notes.append(f"PEG {peg:.1f}")
+    ps = f.get("priceToSalesTrailing12Months")
+    if ps and ps > 0:
+        parts.append(1 if ps < 2 else -1 if ps > 10 else 0)
+        notes.append(f"P/S {ps:.1f}")
+    return _avg_vote(parts), ", ".join(notes) or "no valuation data"
+
+
+def lens_quality(f: dict) -> tuple[int, str]:
+    parts, notes = [], []
+    rg = f.get("revenueGrowth")
+    if rg is not None:
+        parts.append(1 if rg > 0.10 else -1 if rg < 0 else 0)
+        notes.append(f"rev g/ {rg*100:+.0f}%")
+    eg = f.get("earningsGrowth")
+    if eg is not None:
+        parts.append(1 if eg > 0.10 else -1 if eg < 0 else 0)
+        notes.append(f"eps g/ {eg*100:+.0f}%")
+    pm = f.get("profitMargins")
+    if pm is not None:
+        parts.append(1 if pm > 0.15 else -1 if pm < 0.05 else 0)
+        notes.append(f"margin {pm*100:.0f}%")
+    roe = f.get("returnOnEquity")
+    if roe is not None:
+        parts.append(1 if roe > 0.15 else -1 if roe < 0 else 0)
+        notes.append(f"ROE {roe*100:.0f}%")
+    return _avg_vote(parts), ", ".join(notes) or "no fundamentals"
+
+
+def lens_analysts(a: dict) -> tuple[int, str]:
+    parts, notes = [], []
+    up = a.get("upside")
+    if up is not None:
+        parts.append(1 if up > 0.15 else -1 if up < -0.05 else 0)
+        notes.append(f"{up*100:+.0f}% to target")
+    rec = a.get("rec_mean")
+    if rec:
+        parts.append(1 if rec < 2.5 else -1 if rec > 3.5 else 0)
+        label = a.get("rec_key") or f"{rec:.1f}"
+        notes.append(f"consensus {label}")
+    n = a.get("n_analysts")
+    if n:
+        notes.append(f"{n} analysts")
+    return _avg_vote(parts), ", ".join(str(x) for x in notes) or "no coverage"
+
+
+def lens_environment(env: dict) -> tuple[int, str]:
+    parts, notes = [], []
+    if "spy_above_200" in env:
+        up = env["spy_above_200"]
+        parts.append(1 if up else -1)
+        notes.append(f"SPY {'above' if up else 'below'} 200-day")
+    vix = env.get("vix")
+    if vix is not None:
+        parts.append(1 if vix < 20 else -1 if vix > 30 else 0)
+        notes.append(f"VIX {vix:.0f}")
+    return _avg_vote(parts), ", ".join(notes) or "n/a"
+
+
+def lens_relative(rel: dict) -> tuple[int, str]:
+    parts, notes = [], []
+    stock, spy, sec = rel.get("stock"), rel.get("spy"), rel.get("sector")
+    if stock is not None and spy is not None:
+        parts.append(1 if stock > spy else -1)
+        notes.append(f"{(stock-spy)*100:+.0f}% vs SPY (3m)")
+    if stock is not None and sec is not None:
+        parts.append(1 if stock > sec else -1)
+        notes.append(f"{(stock-sec)*100:+.0f}% vs {rel.get('etf')}")
+    return _avg_vote(parts), ", ".join(notes) or "n/a"
+
+
+def lens_sentiment(news_avg: float, n: int) -> tuple[int, str]:
+    if n == 0:
+        return 0, "no headlines"
+    vote = 1 if news_avg > 0.3 else -1 if news_avg < -0.3 else 0
+    return vote, f"avg {news_avg:+.1f} over {n} headlines"
+
+
+def conviction_engine(df, f, a, env, rel, news_avg, n_news, days_to_earnings):
+    """Run every lens, then derive direction + a conviction level from agreement."""
+    lenses = [
+        ("Trend", 1.0, *lens_trend(df)),
+        ("Momentum", 1.0, *lens_momentum(df)),
+        ("Valuation", 1.0, *lens_valuation(f)),
+        ("Quality / growth", 1.0, *lens_quality(f)),
+        ("Analyst targets", 1.0, *lens_analysts(a)),
+        ("Market regime", 1.0, *lens_environment(env)),
+        ("Relative strength", 1.0, *lens_relative(rel)),
+        ("News sentiment", 0.5, *lens_sentiment(news_avg, n_news)),
+    ]
+    # lenses: (name, weight, vote, detail)
+    weighted_sum = sum(w * v for _, w, v, _ in lenses)
+    weight_total = sum(w for _, w, _, _ in lenses) or 1
+    direction = weighted_sum / weight_total  # -1 .. +1
+
+    active = [(w, v) for _, w, v, _ in lenses if v != 0]
+    net_sign = 1 if direction > 0 else -1 if direction < 0 else 0
+    agree_w = sum(w for w, v in active if v == net_sign)
+    disagree_w = sum(w for w, v in active if v == -net_sign)
+    agreement = agree_w / (agree_w + disagree_w) if (agree_w + disagree_w) else 0.0
+    participation = len(active)
+
+    # Direction label
+    if direction >= 0.30:
         label, color = "BUY", "#22c55e"
-    elif blended <= -0.34:
+    elif direction <= -0.30:
         label, color = "SELL", "#ef4444"
     else:
         label, color = "NEUTRAL", "#eab308"
 
+    # Conviction = agreement × participation, then capped by event risk
+    if net_sign == 0 or participation < 3:
+        conviction = "LOW"
+    elif agreement >= 0.78 and participation >= 5:
+        conviction = "HIGH"
+    elif agreement >= 0.62:
+        conviction = "MEDIUM"
+    else:
+        conviction = "LOW"
+
+    event_warning = None
+    if days_to_earnings is not None and 0 <= days_to_earnings <= 7:
+        event_warning = (f"Earnings in {days_to_earnings} day(s) — a binary event "
+                         "the chart can't predict. Conviction capped.")
+        if conviction == "HIGH":
+            conviction = "MEDIUM"
+        elif conviction == "MEDIUM":
+            conviction = "LOW"
+
+    conv_color = {"HIGH": "#22c55e", "MEDIUM": "#eab308", "LOW": "#9ca3af"}[conviction]
+
     return {
-        "label": label,
-        "color": color,
-        "blended": blended,
-        "tech_sum": tech_sum,
-        "tech_max": tech_max,
-        "signals": signals,
-        "news_norm": news_norm,
+        "label": label, "color": color,
+        "direction": direction, "agreement": agreement,
+        "participation": participation, "conviction": conviction,
+        "conv_color": conv_color, "lenses": lenses,
+        "event_warning": event_warning,
     }
 
 
@@ -466,42 +753,150 @@ with st.expander("See the raw data"):
     st.dataframe(data.tail(60), use_container_width=True)
 
 # --------------------------------------------------------------------------
-# Suggestion — at the very bottom, on purpose. Read everything above first.
+# Conviction dashboard — at the very bottom, on purpose. Read the chart first.
 # --------------------------------------------------------------------------
 st.markdown("---")
-st.subheader("Mechanical suggestion")
+st.header("Conviction dashboard")
 
-news_items = news_feed(ticker)
+with st.spinner("Gathering fundamentals, analyst targets & market environment…"):
+    fund = fundamentals(ticker)
+    analyst = analyst_view(ticker)
+    env = market_environment()
+    rel = relative_strength(ticker, fund.get("sector"))
+    earn = earnings_proximity(ticker)
+    news_items = news_feed(ticker)
 news_avg, scored_news = news_sentiment(news_items)
-verdict = combined_suggestion(data, news_avg)
 
-v1, v2 = st.columns([1, 2])
+verdict = conviction_engine(
+    data, fund, analyst, env, rel, news_avg, len(news_items), earn["days"]
+)
+
+
+def _fmt(v, kind=""):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "—"
+    if kind == "pct":
+        return f"{v*100:+.1f}%"
+    if kind == "x":
+        return f"{v:.1f}×"
+    if kind == "money":
+        for unit, div in (("T", 1e12), ("B", 1e9), ("M", 1e6)):
+            if abs(v) >= div:
+                return f"${v/div:.1f}{unit}"
+        return f"${v:,.0f}"
+    if isinstance(v, float):
+        return f"{v:.2f}"
+    return str(v)
+
+
+# --- Verdict + conviction meter ------------------------------------------
+v1, v2 = st.columns([1, 1])
 with v1:
     st.markdown(
         f"<div style='text-align:center;padding:1.2rem;border-radius:12px;"
         f"background:{verdict['color']}22;border:2px solid {verdict['color']};'>"
+        f"<div style='font-size:0.8rem;opacity:0.7;'>DIRECTION</div>"
         f"<div style='font-size:2.4rem;font-weight:800;color:{verdict['color']};"
-        f"line-height:1;'>{verdict['label']}</div>"
-        f"<div style='font-size:0.8rem;opacity:0.7;margin-top:0.4rem;'>"
-        f"score {verdict['blended']:+.2f} &nbsp;(−1 sell … +1 buy)</div></div>",
+        f"line-height:1.1;'>{verdict['label']}</div>"
+        f"<div style='font-size:0.8rem;opacity:0.7;margin-top:0.3rem;'>"
+        f"score {verdict['direction']:+.2f} (−1 sell … +1 buy)</div></div>",
         unsafe_allow_html=True,
     )
 with v2:
-    st.caption(
-        f"Technical vote: **{verdict['tech_sum']:+d}** out of "
-        f"±{verdict['tech_max']} signals &nbsp;·&nbsp; "
-        f"News tilt: **{verdict['news_norm']:+.2f}** "
-        f"from {len(news_items)} headlines."
+    st.markdown(
+        f"<div style='text-align:center;padding:1.2rem;border-radius:12px;"
+        f"background:{verdict['conv_color']}22;border:2px solid {verdict['conv_color']};'>"
+        f"<div style='font-size:0.8rem;opacity:0.7;'>CONVICTION</div>"
+        f"<div style='font-size:2.4rem;font-weight:800;color:{verdict['conv_color']};"
+        f"line-height:1.1;'>{verdict['conviction']}</div>"
+        f"<div style='font-size:0.8rem;opacity:0.7;margin-top:0.3rem;'>"
+        f"{verdict['agreement']*100:.0f}% of {verdict['participation']} active "
+        f"lenses agree</div></div>",
+        unsafe_allow_html=True,
     )
-    for name, vote, why in verdict["signals"]:
-        mark = "🟢" if vote > 0 else "🔴" if vote < 0 else "⚪️"
-        st.markdown(f"{mark} **{name}** — {why}")
+
+if verdict["event_warning"]:
+    st.warning("📅 " + verdict["event_warning"])
+
+# --- The lenses ----------------------------------------------------------
+st.markdown("##### How each lens votes")
+st.caption(
+    "Conviction is high only when independent lenses agree. Disagreement "
+    "below is the signal — it tells you the call is contested."
+)
+for name, weight, vote, detail in verdict["lenses"]:
+    mark = "🟢" if vote > 0 else "🔴" if vote < 0 else "⚪️"
+    wlabel = "" if weight == 1.0 else f"  ·  weight {weight:g}"
+    st.markdown(f"{mark} **{name}** — {detail}{wlabel}")
+
+# --- Supporting detail panels --------------------------------------------
+st.markdown("##### The data behind it")
+p1, p2, p3 = st.columns(3)
+
+with p1:
+    st.markdown("**Valuation & quality**")
+    rows = [
+        ("Fwd P/E", _fmt(fund.get("forwardPE"))),
+        ("Trailing P/E", _fmt(fund.get("trailingPE"))),
+        ("PEG", _fmt(fund.get("pegRatio"))),
+        ("P/S", _fmt(fund.get("priceToSalesTrailing12Months"))),
+        ("Rev growth", _fmt(fund.get("revenueGrowth"), "pct")),
+        ("EPS growth", _fmt(fund.get("earningsGrowth"), "pct")),
+        ("Profit margin", _fmt(fund.get("profitMargins"), "pct")),
+        ("ROE", _fmt(fund.get("returnOnEquity"), "pct")),
+        ("Market cap", _fmt(fund.get("marketCap"), "money")),
+    ]
+    for k, val in rows:
+        st.caption(f"{k}: **{val}**")
+
+with p2:
+    st.markdown("**Analyst view**")
+    if analyst.get("target_mean"):
+        st.caption(f"Mean target: **${analyst['target_mean']:,.2f}**")
+        st.caption(f"Implied upside: **{_fmt(analyst.get('upside'), 'pct')}**")
+        st.caption(f"Range: {_fmt(analyst.get('target_low'))} – "
+                   f"{_fmt(analyst.get('target_high'))}")
+        st.caption(f"Consensus: **{analyst.get('rec_key') or '—'}** "
+                   f"(mean {_fmt(analyst.get('rec_mean'))}, 1=buy 5=sell)")
+        st.caption(f"Analysts: {analyst.get('n_analysts') or '—'}")
+    else:
+        st.caption("No analyst coverage returned.")
+    st.markdown("**Event risk**")
+    if earn.get("days") is not None:
+        st.caption(f"Next earnings: **{earn['date']}** "
+                   f"({earn['days']} days out)")
+    else:
+        st.caption("No scheduled earnings date found.")
+
+with p3:
+    st.markdown("**Market environment**")
+    if "spy_above_200" in env:
+        st.caption(f"SPY vs 200-day: **{'above ✅' if env['spy_above_200'] else 'below ⚠️'}**")
+    if env.get("spy_ret_3m") is not None:
+        st.caption(f"SPY 3-mo return: **{_fmt(env['spy_ret_3m'], 'pct')}**")
+    if env.get("vix") is not None:
+        mood = "calm" if env["vix"] < 20 else "elevated" if env["vix"] < 30 else "fearful"
+        st.caption(f"VIX: **{env['vix']:.1f}** ({mood})")
+    if env.get("tnx") is not None:
+        st.caption(f"10-yr yield: **{env['tnx']:.2f}%**")
+    st.markdown("**Relative strength (3-mo total return)**")
+    if rel.get("stock") is not None:
+        st.caption(f"{ticker}: **{_fmt(rel['stock'], 'pct')}**")
+    if rel.get("spy") is not None:
+        delta = (rel["stock"] - rel["spy"]) if rel.get("stock") is not None else None
+        st.caption(f"SPY: {_fmt(rel['spy'], 'pct')}  →  {ticker} "
+                   f"**{_fmt(delta, 'pct')}** vs SPY")
+    if rel.get("sector") is not None:
+        delta = (rel["stock"] - rel["sector"]) if rel.get("stock") is not None else None
+        st.caption(f"{rel.get('etf')} (sector): {_fmt(rel['sector'], 'pct')}  →  "
+                   f"{ticker} **{_fmt(delta, 'pct')}** vs sector")
 
 st.warning(
-    "This label is a weighted tally of the indicators above (75%) plus a "
-    "keyword read of recent headlines (25%). It is **not a forecast and not "
-    "financial advice** — it can't see fundamentals, valuation, your time "
-    "horizon, or anything the chart doesn't already show. The decision is yours."
+    "This combines technicals, fundamentals, analyst targets, the market "
+    "regime, relative strength and headline sentiment into one view. It is "
+    "**not a forecast and not financial advice.** More inputs reduce false "
+    "signals but can also manufacture false confidence — treat LOW conviction "
+    "as a genuine 'I don't know,' and always do your own work. The decision is yours."
 )
 
 with st.expander(f"Headlines factored in ({len(news_items)})"):
